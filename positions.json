@@ -1,0 +1,58 @@
+{
+  "positions": {
+    "MIRAUSDT": {
+      "qty": 30.8,
+      "entry": 1.4522000000000002,
+      "opened_at": "2025-09-27T07:12:46.283379Z",
+      "source": "auto_split"
+    },
+    "XPLUSDT": {
+      "qty": 28.8,
+      "entry": 1.5571,
+      "opened_at": "2025-09-27T07:12:47.624004Z",
+      "source": "auto_split"
+    },
+    "ALPINEUSDT": {
+      "qty": 7.47,
+      "entry": 6.001,
+      "opened_at": "2025-09-27T07:12:48.960002Z",
+      "source": "auto_split"
+    },
+    "ZKCUSDT": {
+      "qty": 80.4,
+      "entry": 0.5579,
+      "opened_at": "2025-09-27T07:12:50.290964Z",
+      "source": "auto_split"
+    },
+    "TWTUSDT": {
+      "qty": 35.0,
+      "entry": 1.281,
+      "opened_at": "2025-09-27T07:12:51.616280Z",
+      "source": "auto_split"
+    },
+    "ZROUSDT": {
+      "qty": 2.36,
+      "entry": 2.388,
+      "opened_at": "2025-09-27T07:15:15.733396Z",
+      "source": "auto_split"
+    },
+    "SANTOSUSDT": {
+      "qty": 2.77,
+      "entry": 2.037,
+      "opened_at": "2025-09-27T07:15:17.240209Z",
+      "source": "auto_split"
+    },
+    "AWEUSDT": {
+      "qty": 55.0,
+      "entry": 0.10231,
+      "opened_at": "2025-09-27T07:15:18.695748Z",
+      "source": "auto_split"
+    },
+    "SUNUSDT": {
+      "qty": 234.0,
+      "entry": 0.024110000000000003,
+      "opened_at": "2025-09-27T07:15:20.520235Z",
+      "source": "auto_split"
+    }
+  }
+}

@@ -1,0 +1,5 @@
+# --------------
+fastapi==0.115.0  # (לא חובה כאן, נשאר מהסקלטון קודם)
+python-dotenv==1.0.1 
+binance-connector==3.6.0 
+pyyaml==6.0.2

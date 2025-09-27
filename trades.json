@@ -1,0 +1,85 @@
+{
+  "trades": [
+    {
+      "ts": "2025-09-27T07:12:46.282305+00:00",
+      "side": "BUY",
+      "symbol": "MIRAUSDT",
+      "qty": 30.8,
+      "avg": 1.4522000000000002,
+      "quote": null,
+      "reason": "BUY_MARKET"
+    },
+    {
+      "ts": "2025-09-27T07:12:47.623644+00:00",
+      "side": "BUY",
+      "symbol": "XPLUSDT",
+      "qty": 28.8,
+      "avg": 1.5571,
+      "quote": null,
+      "reason": "BUY_MARKET"
+    },
+    {
+      "ts": "2025-09-27T07:12:48.959570+00:00",
+      "side": "BUY",
+      "symbol": "ALPINEUSDT",
+      "qty": 7.47,
+      "avg": 6.001,
+      "quote": null,
+      "reason": "BUY_MARKET"
+    },
+    {
+      "ts": "2025-09-27T07:12:50.290100+00:00",
+      "side": "BUY",
+      "symbol": "ZKCUSDT",
+      "qty": 80.4,
+      "avg": 0.5579,
+      "quote": null,
+      "reason": "BUY_MARKET"
+    },
+    {
+      "ts": "2025-09-27T07:12:51.615957+00:00",
+      "side": "BUY",
+      "symbol": "TWTUSDT",
+      "qty": 35.0,
+      "avg": 1.281,
+      "quote": null,
+      "reason": "BUY_MARKET"
+    },
+    {
+      "ts": "2025-09-27T07:15:15.733026+00:00",
+      "side": "BUY",
+      "symbol": "ZROUSDT",
+      "qty": 2.36,
+      "avg": 2.388,
+      "quote": null,
+      "reason": "BUY_MARKET"
+    },
+    {
+      "ts": "2025-09-27T07:15:17.239534+00:00",
+      "side": "BUY",
+      "symbol": "SANTOSUSDT",
+      "qty": 2.77,
+      "avg": 2.037,
+      "quote": null,
+      "reason": "BUY_MARKET"
+    },
+    {
+      "ts": "2025-09-27T07:15:18.695375+00:00",
+      "side": "BUY",
+      "symbol": "AWEUSDT",
+      "qty": 55.0,
+      "avg": 0.10231,
+      "quote": null,
+      "reason": "BUY_MARKET"
+    },
+    {
+      "ts": "2025-09-27T07:15:20.519864+00:00",
+      "side": "BUY",
+      "symbol": "SUNUSDT",
+      "qty": 234.0,
+      "avg": 0.024110000000000003,
+      "quote": null,
+      "reason": "BUY_MARKET"
+    }
+  ]
+}
