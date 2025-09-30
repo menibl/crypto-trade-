@@ -1,0 +1,51 @@
+# ===============================
+# bot_5pct.py — hot reload patch
+# ===============================
+# Paste the following into your bot file.
+#
+# --- Top-level (near other constants) ---
+from pathlib import Path
+ENV_FILE    = Path(__file__).parent / ".env"
+RELOAD_FLAG = Path(__file__).parent / "reload.flag"
+_LAST_ENV_MTIME = 0.0
+
+# --- Add with your other imports ---
+from dotenv import load_dotenv
+
+# --- Function (put near load_env or utilities) ---
+def reload_cfg_if_changed(cfg, client):
+    """
+    Reload .env into cfg when either reload.flag exists or .env mtime changed.
+    If API keys / base_url changed → rebuild Spot client.
+    Returns (cfg, client, reloaded: bool).
+    """
+    global _LAST_ENV_MTIME
+    need = RELOAD_FLAG.exists()
+    try:
+        mtime = ENV_FILE.stat().st_mtime
+    except FileNotFoundError:
+        mtime = _LAST_ENV_MTIME
+    if mtime > _LAST_ENV_MTIME:
+        need = True
+    if not need:
+        return cfg, client, False
+
+    load_dotenv(ENV_FILE, override=True)
+    new_cfg = load_env()   # assumes you already have a load_env() that returns dict
+
+    if (new_cfg.get("base_url") != cfg.get("base_url")
+        or new_cfg.get("api_key") != cfg.get("api_key")
+        or new_cfg.get("api_secret") != cfg.get("api_secret")):
+        client = client_from_cfg(new_cfg)
+
+    _LAST_ENV_MTIME = mtime
+    if RELOAD_FLAG.exists():
+        try: RELOAD_FLAG.unlink()
+        except Exception: pass
+
+    return new_cfg, client, True
+
+# --- Inside main() loop (each iteration) ---
+cfg, client, reloaded = reload_cfg_if_changed(cfg, client)
+if reloaded:
+    logging.info("Hot-reload: applied new .env settings")

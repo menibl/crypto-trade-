@@ -1,10 +1,11 @@
 # =============================================
-# dashboard.py  — FastAPI control panel for the bot
+# dashboard.py  — FastAPI control panel for the bot (with .env editor + live reload)
 # =============================================
 # Features:
 # - Start / Stop the bot loop (via stop.flag file signaling)
-# - Panic liquidate: sell every non‑USDT asset to USDT (best‑effort, skips dust)
+# - Panic liquidate: sell every non‑QUOTE asset to QUOTE (best‑effort, skips dust)
 # - Status: quote balance, open positions (positions.json), recent trades (trades.json)
+# - **NEW**: Edit .env keys from the UI + apply immediately (touches reload.flag)
 # - Serves a small web UI at http://localhost:8000
 #
 # Usage:
@@ -13,20 +14,19 @@
 #   → open http://localhost:8000
 #
 # Notes:
-# - Minimal integration changes needed in bot_5pct.py — see patch at the bottom of this file.
-# - The dashboard does not import your bot loop; it controls it via a flag file and reads/writes JSON files.
+# - The bot must support hot-reload by watching reload.flag or .env mtime. See patch at bottom.
 # - Keep dashboard.py in the same folder as: .env, bot_5pct.py, positions.json, trades.json
 
-import os, json, math, time, threading
+import os, json, math, time, logging
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values, set_key
 from binance.spot import Spot as SpotClient
 from binance.error import ClientError
 
@@ -34,13 +34,16 @@ APP_DIR = Path(__file__).parent
 STATE_POS = APP_DIR / "positions.json"
 STATE_TRD = APP_DIR / "trades.json"
 STOP_FLAG = APP_DIR / "stop.flag"
+RELOAD_FLAG = APP_DIR / "reload.flag"
+ENV_FILE  = APP_DIR / ".env"
+
 TESTNET_URL = "https://testnet.binance.vision"
 PROD_URL    = "https://api.binance.com"
 
 # ------------------- helpers -------------------
 
 def load_env() -> Dict[str, Any]:
-    load_dotenv(dotenv_path=APP_DIR/".env")
+    load_dotenv(dotenv_path=ENV_FILE)
     env = (os.getenv("BINANCE_ENV") or "prod").lower()
     return {
         "api_key": os.getenv("BINANCE_API_KEY"),
@@ -56,7 +59,6 @@ def get_client():
         raise RuntimeError("Missing API keys in .env")
     return SpotClient(api_key=cfg["api_key"], api_secret=cfg["api_secret"], base_url=cfg["base_url"]), cfg
 
-
 def read_json(path: Path, default):
     if not path.exists():
         return default
@@ -65,17 +67,14 @@ def read_json(path: Path, default):
     except Exception:
         return default
 
-
 def write_json(path: Path, obj):
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
-
 
 # ------------------- liquidation -------------------
 
 def round_down(x, step):
     if step <= 0: return x
     return math.floor(x / step) * step
-
 
 def symbol_filters(client: SpotClient, symbol: str):
     s = client.exchange_info(symbol=symbol)["symbols"][0]
@@ -89,7 +88,6 @@ def symbol_filters(client: SpotClient, symbol: str):
         "minNotional": float(notional["minNotional"]) if notional else None,
     }
 
-
 def get_balance(client: SpotClient, asset: str):
     acct = client.account(recvWindow=5000)
     for b in acct["balances"]:
@@ -97,8 +95,7 @@ def get_balance(client: SpotClient, asset: str):
             return float(b["free"]), float(b["locked"])
     return 0.0, 0.0
 
-
-def sell_all_to_usdt(client: SpotClient) -> Dict[str, Any]:
+def sell_all_to_quote(client: SpotClient) -> Dict[str, Any]:
     cfg = load_env()
     acct = client.account(recvWindow=5000)
     assets = [(b["asset"], float(b["free"])) for b in acct["balances"] if float(b["free"]) > 0]
@@ -144,18 +141,14 @@ def sell_all_to_usdt(client: SpotClient) -> Dict[str, Any]:
         time.sleep(0.2)
     return {"summary": results}
 
-
 # ------------------- API -------------------
-import logging
-from logging.handlers import RotatingFileHandler
 
+from logging.handlers import RotatingFileHandler
 def init_dashboard_logging():
     log_name = os.getenv("BOT_LOG_FILE", "bot.log")
     log_level = os.getenv("BOT_LOG_LEVEL", "INFO").upper()
     log_path = APP_DIR / log_name
     log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # אל תפריע לקונפיג הקיים אם כבר רץ הבוט באותו פרוסס; אבל כאן בד"כ תהליך נפרד.
     if not logging.getLogger().handlers:
         fh = RotatingFileHandler(str(log_path), maxBytes=5_000_000, backupCount=3, encoding="utf-8")
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -168,15 +161,55 @@ init_dashboard_logging()
 
 app = FastAPI(title="Trading Bot Dashboard")
 
-# Static UI (served from in-memory string below)
-STATIC_DIR = APP_DIR / "static"
-STATIC_DIR.mkdir(exist_ok=True)
-INDEX_HTML = STATIC_DIR / "index.html"
+# ---- NEW: .env editor ----
+# Lock down to these keys; add/remove as you need.
+ALLOWED_ENV_KEYS = [
+    "LOG_LEVEL","QUOTE_ASSET","BASE_BLACKLIST",
+    "TARGET_TP_PCT","OPTIONAL_SL_PCT","TRAILING_STOP_PCT","TRAILING_ARM_PNL_PCT",
+    "MAX_OPEN_POSITIONS","ALLOCATION_USD",
+    "USE_ALL_BALANCE","BALANCE_RESERVE_PCT","CONSOLIDATE_AT_START",
+    "AUTO_SPLIT","SPLIT_SLICES","MIN_SLICE_USD",
+    "MIN_24H_QUOTE_VOL","MAX_SPREAD_BPS","SCAN_INTERVAL_SEC","EOD_HHMM",
+    "PORTFOLIO_TARGET_PCT","PORTFOLIO_STOP_PCT",
+    "ROTATION_ENABLED","ROTATION_EDGE_PCT","FEE_BPS","SLIPPAGE_BPS",
+    "REGIME_CHECK_ENABLED","REGIME_TF","REGIME_EMA_SHORT","REGIME_EMA_LONG","REGIME_MIN_AGREE","REGIME_COOLDOWN_MIN",
+    "BUY_TF","BUY_EMA_SHORT","BUY_EMA_LONG","BUY_MIN_SLOPE_PCT_PER_BAR",
+    "HTF_ALIGN_ENABLED","HTF_TF","HTF_EMA_SHORT","HTF_EMA_LONG",
+    "USE_MAKER","MAKER_WAIT_SEC","LOSS_COOLDOWN_MIN"
+]
+
+@app.get("/env")
+def get_env():
+    env = dotenv_values(ENV_FILE)
+    return {k: env.get(k, "") for k in ALLOWED_ENV_KEYS}
+
+class EnvPayload(BaseModel):
+    apply: bool = True
+    updates: Dict[str, str] = {}
+
+@app.post("/env")
+def set_env(payload: EnvPayload):
+    env = dotenv_values(ENV_FILE)
+    changed = 0
+    for k, v in (payload.updates or {}).items():
+        if k in ALLOWED_ENV_KEYS:
+            set_key(ENV_FILE.as_posix(), k, "" if v is None else str(v), quote_mode="never")
+            changed += 1
+    if payload.apply:
+        RELOAD_FLAG.write_text(str(datetime.utcnow()))
+    return {"ok": True, "changed": changed, "applied": payload.apply}
+
+@app.post("/reload")
+def reload_now():
+    RELOAD_FLAG.write_text(str(datetime.utcnow()))
+    return {"ok": True, "message": "reload.flag touched"}
+
+# ------------------- legacy endpoints -------------------
 
 @app.get("/status")
 def status():
     c, cfg = get_client()
-    usdt, _ = get_balance(c, cfg["quote"])
+    quote, _ = get_balance(c, cfg["quote"])
     running = not STOP_FLAG.exists()
     positions = read_json(STATE_POS, {"positions": {}})
     trades = read_json(STATE_TRD, {"trades": []})
@@ -184,7 +217,7 @@ def status():
         "env": cfg["env"],
         "quote": cfg["quote"],
         "running": running,
-        "quote_free": usdt,
+        "quote_free": quote,
         "positions": positions.get("positions", {}),
         "trades": trades.get("trades", [])[-100:],
     }
@@ -207,14 +240,17 @@ def stop(cmd: Command):
 
 @app.post("/panic")
 def panic(cmd: Command):
-    logging.warning("DASHBOARD: PANIC requested → sell all to USDT")
+    logging.warning("DASHBOARD: PANIC requested → sell all to QUOTE")
     c, _ = get_client()
-    res = sell_all_to_usdt(c)
+    res = sell_all_to_quote(c)
     logging.warning("DASHBOARD: PANIC result → %s", res)
     return {"ok": True, "result": res}
 
+# ------------- UI -------------
+STATIC_DIR = APP_DIR / "static"
+STATIC_DIR.mkdir(exist_ok=True)
+INDEX_HTML = STATIC_DIR / "index.html"
 
-# ------------- tiny UI -------------
 UI_HTML = """
 <!doctype html>
 <html>
@@ -231,19 +267,20 @@ UI_HTML = """
     table{border-collapse:collapse; width:100%}
     th,td{border-bottom:1px solid #eee; padding:6px 8px; text-align:left}
     .pill{display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6}
+    input[type=text]{width:240px;padding:6px;margin:4px 0;}
+    .grid{display:grid;grid-template-columns:repeat(2, minmax(260px,1fr));gap:12px}
   </style>
 </head>
 <body>
   <h1>Trading Bot Dashboard</h1>
   <div class="row">
     <div class="card">
-      <div>Env: <span id="env" class="pill">-</span> · Quote: <span id="quote" class="pill">-</span></div>
-      <div>Running: <span id="running" class="pill">-</span></div>
+      <div>Running: <span id="running" class="pill">-</span> · Env: <span id="env" class="pill">-</span> · Quote: <span id="quote" class="pill">-</span></div>
       <div>Quote free: <b id="quote_free">-</b></div>
       <div style="margin-top:8px">
-        <button onclick="doStart()">Start (clear stop flag)</button>
-        <button onclick="doStop()">Stop (create stop.flag)</button>
-        <button onclick="doPanic()" style="background:#fee2e2">Panic: Liquidate → USDT</button>
+        <button onclick="doStart()">Start</button>
+        <button onclick="doStop()">Stop</button>
+        <button onclick="doPanic()" style="background:#fee2e2">Panic → QUOTE</button>
         <button onclick="refresh()">Refresh</button>
       </div>
     </div>
@@ -262,156 +299,129 @@ UI_HTML = """
 
   <div class="row" style="margin-top:16px">
     <div class="card" style="flex:1; min-width:320px">
-      <h3>P&amp;L by Symbol</h3>
-      <table id="pnl"><thead><tr><th>Symbol</th><th>Realized P&amp;L (USDT)</th><th>Trades</th><th>Win rate</th></tr></thead><tbody></tbody></table>
-    </div>
-    <div class="card" style="flex:1; min-width:320px">
-      <h3>Equity Curve (Realized)</h3>
-      <canvas id="equity" width="600" height="220"></canvas>
+      <h3>.env Editor</h3>
+      <div id="envGrid" class="grid"></div>
+      <div style="margin-top:8px">
+        <button onclick="saveEnv()">Save .env</button>
+        <button onclick="applyReload()">Save + Apply</button>
+        <button onclick="reloadOnly()">Reload from .env</button>
+      </div>
     </div>
   </div>
 
 <script>
 async function refresh(){
-  const r = await fetch('/status');
-  const s = await r.json();
+  const r = await fetch('/status'); const s = await r.json();
   document.getElementById('env').textContent = s.env;
   document.getElementById('quote').textContent = s.quote;
   document.getElementById('running').textContent = s.running ? 'YES' : 'NO';
   document.getElementById('quote_free').textContent = (+s.quote_free).toFixed(6);
-  // positions
-  const tbody = document.querySelector('#pos tbody');
-  tbody.innerHTML = '';
+
+  const tbody = document.querySelector('#pos tbody'); tbody.innerHTML = '';
   for (const [sym, p] of Object.entries(s.positions||{})){
     const tr = document.createElement('tr');
     tr.innerHTML = `<td>${sym}</td><td>${(+p.qty).toFixed(8)}</td><td>${(+p.entry).toFixed(8)}</td><td>${p.opened_at||''}</td><td>${p.source||''}</td>`;
     tbody.appendChild(tr);
   }
-  // trades
-  const trades = (s.trades||[]).slice();
-  const ttb = document.querySelector('#trades tbody');
-  ttb.innerHTML = '';
-  for (const t of trades.slice().reverse()){
+
+  const trades = (s.trades||[]).slice().reverse();
+  const ttb = document.querySelector('#trades tbody'); ttb.innerHTML = '';
+  for (const t of trades){
     const tr = document.createElement('tr');
     tr.innerHTML = `<td>${t.ts||''}</td><td>${t.side||''}</td><td>${t.symbol||''}</td><td>${(+t.qty||0).toFixed(8)}</td><td>${t.avg?(+t.avg).toFixed(8):''}</td><td>${t.quote?(+t.quote).toFixed(8):''}</td><td>${t.reason||''}</td>`;
     ttb.appendChild(tr);
   }
-  // ---- P&L by symbol & Equity curve (realized) ----
-  // Reconstruct per-symbol FIFO cost and realized P&L using trades array
-  const fifo = {}; // symbol -> [{qty, cost_per_unit}]
-  const pnlBySym = {}; // symbol -> realized P&L in quote
-  const equityPoints = []; // [{t, cum}]
-  let cum = 0;
-  const sorted = trades.slice().sort((a,b)=> (a.ts||'').localeCompare(b.ts||''));
-  for (const t of sorted){
-    const sym = t.symbol; if (!sym) continue;
-    const side = (t.side||'').toUpperCase();
-    const qty = +t.qty || 0; if (!qty) continue;
-    const avg = +t.avg || 0;
-    const quote = (t.quote != null) ? +t.quote : (avg*qty);
-    if (side === 'BUY'){
-      if (!fifo[sym]) fifo[sym] = [];
-      fifo[sym].push({qty: qty, price: avg});
-    } else if (side === 'SELL'){
-      let remain = qty, cost = 0;
-      const q = fifo[sym] || [];
-      while (remain > 1e-12 && q.length){
-        const lot = q[0];
-        const take = Math.min(remain, lot.qty);
-        cost += take * lot.price;
-        lot.qty -= take;
-        remain -= take;
-        if (lot.qty <= 1e-12) q.shift();
-      }
-      const realized = quote - cost; // in quote asset (USDT)
-      pnlBySym[sym] = (pnlBySym[sym]||0) + realized;
-      cum += realized;
-      equityPoints.push({t: t.ts, v: cum});
-    }
-  }
-  // Fill P&L table
-  const pBody = document.querySelector('#pnl tbody');
-  pBody.innerHTML = '';
-  for (const [sym, val] of Object.entries(pnlBySym).sort((a,b)=>b[1]-a[1])){
-    const nTrades = trades.filter(x=>x.symbol===sym && (x.side||'').toUpperCase()==='SELL').length;
-    const wins = trades.filter(x=>x.symbol===sym && (x.side||'').toUpperCase()==='SELL' && ((+x.quote||0) - ((+x.avg||0)*(+x.qty||0)) > 0)).length;
-    const wr = nTrades? (wins/nTrades*100).toFixed(1)+'%':'-';
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${sym}</td><td>${val.toFixed(6)}</td><td>${nTrades}</td><td>${wr}</td>`;
-    pBody.appendChild(tr);
-  }
-  // Draw equity curve on canvas (simple line chart)
-  drawLineChart('equity', equityPoints.map(x=>x.v));
 }
 
-function drawLineChart(id, values){
-  const c = document.getElementById(id);
-  const ctx = c.getContext('2d');
-  ctx.clearRect(0,0,c.width,c.height);
-  if (!values || values.length===0){
-    ctx.fillText('No realized P&L yet', 10, 20);
-    return;
-  }
-  const pad = 30, w=c.width, h=c.height;
-  const min = Math.min(...values), max = Math.max(...values);
-  const range = (max-min)||1;
-  // axis
-  ctx.strokeStyle = '#ddd';
-  ctx.beginPath(); ctx.moveTo(pad,h-pad); ctx.lineTo(w-pad,h-pad); ctx.moveTo(pad,pad); ctx.lineTo(pad,h-pad); ctx.stroke();
-  // line
-  ctx.strokeStyle = '#333'; ctx.beginPath();
-  values.forEach((v,i)=>{
-    const x = pad + (w-2*pad) * (i/(values.length-1||1));
-    const y = h-pad - (h-2*pad) * ((v-min)/range);
-    if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+async function loadEnv(){
+  const r = await fetch('/env'); const env = await r.json();
+  const g = document.getElementById('envGrid'); g.innerHTML='';
+  Object.entries(env).forEach(([k,v])=>{
+    const label = document.createElement('label'); label.textContent = k;
+    const input = document.createElement('input'); input.type='text'; input.id='env_'+k; input.value = v ?? '';
+    const wrap = document.createElement('div'); wrap.appendChild(label); wrap.appendChild(input);
+    g.appendChild(wrap);
   });
-  ctx.stroke();
 }
 
-async function doStart(){ await fetch('/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm:true})}); refresh(); }
-async function doStop(){ await fetch('/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm:true})}); refresh(); }
-async function doPanic(){ if(confirm('Sell everything to USDT now?')){ const r = await fetch('/panic',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm:true})}); const d = await r.json(); alert('Done: '+JSON.stringify(d.result)); refresh(); } }
-refresh();
+async function saveEnv(){
+  const updates = {};
+  document.querySelectorAll('#envGrid input').forEach(inp=>{
+    const k = inp.id.replace('env_',''); updates[k] = inp.value;
+  });
+  const r = await fetch('/env', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({apply:false, updates})});
+  const j = await r.json(); alert('Saved: '+j.changed+' keys');
+}
+
+async function applyReload(){
+  const updates = {};
+  document.querySelectorAll('#envGrid input').forEach(inp=>{
+    const k = inp.id.replace('env_',''); updates[k] = inp.value;
+  });
+  const r = await fetch('/env', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({apply:true, updates})});
+  const j = await r.json(); alert('Saved & applied: '+j.changed+' keys');
+}
+
+async function reloadOnly(){
+  const r = await fetch('/reload', {method:'POST'});
+  const j = await r.json(); alert(j.message||'Reload signal sent');
+}
+
+refresh(); loadEnv();
 setInterval(refresh, 5000);
 </script>
 </body>
 </html>
 """
 
-# Write index.html once (idempotent)
-if not INDEX_HTML.exists():
-    INDEX_HTML.write_text(UI_HTML, encoding="utf-8")
+# Write index.html
+STATIC_DIR = APP_DIR / "static"
+STATIC_DIR.mkdir(exist_ok=True)
+INDEX_HTML = STATIC_DIR / "index.html"
+INDEX_HTML.write_text(UI_HTML, encoding="utf-8")
 
+# Mount static (serves index.html at /)
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
 # =========================
 # PATCH for bot_5pct.py
 # =========================
-# 1) בקובץ bot_5pct.py, בתחילת main(), נקה את דגל העצירה אם קיים:
+# 1) At top-level (near other path constants):
 #    from pathlib import Path
-#    STOP_FLAG = Path(__file__).parent / 'stop.flag'
-#    if STOP_FLAG.exists():
-#        STOP_FLAG.unlink()
+#    ENV_FILE   = Path(__file__).parent / ".env"
+#    RELOAD_FLAG= Path(__file__).parent / "reload.flag"
+#    _LAST_ENV_MTIME = 0.0
 #
-# 2) בתוך הלולאה הראשית while True: הוסף בדיקה כדי לעצור נקי:
-#    if STOP_FLAG.exists():
-#        logging.info('stop.flag detected → exiting main loop')
-#        break
+# 2) Add a function to reload when .env changed (or when reload.flag exists):
+#    from dotenv import load_dotenv
+#    def reload_cfg_if_changed(cfg, client):
+#        global _LAST_ENV_MTIME
+#        need = RELOAD_FLAG.exists()
+#        try:
+#            mtime = ENV_FILE.stat().st_mtime
+#        except FileNotFoundError:
+#            mtime = _LAST_ENV_MTIME
+#        if mtime > _LAST_ENV_MTIME:
+#            need = True
+#        if not need:
+#            return cfg, client, False
+#        # re-load .env and rebuild cfg
+#        load_dotenv(ENV_FILE, override=True)
+#        new_cfg = load_env()   # ← your existing loader that returns dict
+#        # if base_url or keys changed, rebuild client
+#        if (new_cfg.get("base_url") != cfg.get("base_url")
+#            or new_cfg.get("api_key") != cfg.get("api_key")
+#            or new_cfg.get("api_secret") != cfg.get("api_secret")):
+#            client = client_from_cfg(new_cfg)
+#        _LAST_ENV_MTIME = mtime
+#        if RELOAD_FLAG.exists():
+#            try: RELOAD_FLAG.unlink()
+#            except Exception: pass
+#        return new_cfg, client, True
 #
-# 3) הוסף רישום עסקאות ל-trades.json בכל BUY/SELL (במקומות new_order):
-#    def log_trade(side, symbol, qty, avg=None, quote=None, reason=''):
-#        path = Path(__file__).parent / 'trades.json'
-#        data = json.loads(path.read_text()) if path.exists() else {"trades": []}
-#        data["trades"].append({
-#            "ts": datetime.utcnow().isoformat()+"Z",
-#            "side": side, "symbol": symbol,
-#            "qty": qty, "avg": avg, "quote": quote, "reason": reason
-#        })
-#        path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+# 3) In your main loop (each tick), call:
+#        cfg, client, reloaded = reload_cfg_if_changed(cfg, client)
+#        if reloaded:
+#            logging.info("Hot-reload: applied new .env settings")
 #
-#    לדוגמה אחרי קנייה מוצלחת:
-#        executed_qty, entry = buy_market_quote(...)
-#        log_trade('BUY', sym, executed_qty, avg=entry, quote=None, reason=state_reason)
-#    ואחרי מכירה (TP/SL/TRAIL/EOD): העבר reason מתאים ו-quote_recv שחזרה מהפקודה
-#
-# זהו — עכשיו dashboard.py יציג את המצב בזמן אמת, ותוכל לשלוט ב-Start/Stop/Panic.
+# Done. Now the dashboard “Save + Apply” touches reload.flag; the bot detects and reloads within seconds.
