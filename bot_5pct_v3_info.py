@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple, Any, Optional
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from decimal import Decimal, ROUND_DOWN, getcontext
-
+from binance.error import ServerError, ClientError  # למעלה בקובץ, עם שאר הייבוא
 try:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -24,6 +24,46 @@ from pathlib import Path
 ENV_FILE    = Path(__file__).parent / ".env"
 RELOAD_FLAG = Path(__file__).parent / "reload.flag"
 _LAST_ENV_MTIME = 0.0
+from logging.handlers import RotatingFileHandler
+# למעלה עם שאר הייבוא
+import random
+
+# גלובלים קטנים לממסר
+_API_ERRS = 0
+_API_DOWN_UNTIL = 0.0
+def setup_logging_from_env():
+    level = (os.getenv("LOG_LEVEL","INFO") or "INFO").upper()
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level, logging.INFO))
+
+    # סילוק הנדלרים ישנים (מונע כפל הנדלרים בהוט-רילוד)
+    for h in list(root.handlers):
+        try:
+            root.removeHandler(h)
+            h.close()
+        except Exception:
+            pass
+
+    # קונסול תמידית
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    root.addHandler(console)
+
+    log_file = os.getenv("LOG_FILE")
+    if log_file:
+        handler = RotatingFileHandler(
+            log_file,
+            maxBytes=int(os.getenv("LOG_MAX_BYTES","10485760")),
+            backupCount=int(os.getenv("LOG_BACKUP_COUNT","3")),
+            encoding="utf-8",
+            delay=True,          # עוזר ב-Windows
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        root.addHandler(handler)
+
+    # להוריד רעש מ-client של Binance וה-HTTP
+    logging.getLogger("binance").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # --- Optional link to crypto_bot.py ---
 CRYPTO_BOT_AVAILABLE = False
@@ -84,15 +124,47 @@ def read_json(path: Path, default: Any):
 
 def write_json(path: Path, obj: Any):
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+def mobo_debug_scan(client, cfg, max_syms=15):
+    try:
+        syms = spot_symbols_for_quote(client, cfg["quote_asset"], cfg["blacklist_keywords"])
+        t24 = client.ticker_24hr()
+        qv = {t["symbol"]: _as_float(t.get("quoteVolume"), 0.0) for t in t24 if t.get("symbol") in syms}
+        top = sorted(qv.items(), key=lambda kv: -kv[1])[:max_syms]
+        logging.info(f"[MOB/diag] top {len(top)} syms by qVol: {[s for s,_ in top]}")
+        for sym, vol in top:
+            ok, obm = mobo_filters_ok(client, sym, cfg)
+            sig, info = mobo_entry_signal(client, sym, cfg)
+            if not info: info = {}
+            bo = (info.get("close", 0) > (info.get("hh20", 0) * cfg["breakout_mult"]))
+            mo = ((info.get("ret15", 0) >= cfg["momentum_ret_15m"]) and (info.get("ema20", 0) > info.get("ema50", 0) > info.get("ema100", 0)))
+            logging.info(
+                f"[MOB/diag] {sym}: qVol={vol:.0f} | spread={obm['spread_bps']:.1f}bps | "
+                f"depth10≈{obm['depth10_bid']:.0f}/{obm['depth10_ask']:.0f} | filters={'OK' if ok else 'BLOCK'} | "
+                f"entry={'YES' if sig else 'no'} (bo={bo}, mo={mo}, z={info.get('zvol',0):.2f})"
+            )
+    except Exception as e:
+        logging.warning(f"[MOB/diag] failed: {e}")
 
-def log_trade(side: str, symbol: str, qty: float, avg: float | None = None, quote: float | None = None, reason: str = ""):
-    data = read_json(TRADES_FILE, {"trades": []})
-    data["trades"].append({
+def log_trade(side: str, symbol: str, qty: float | None, avg: float | None = None, quote: float | None = None, reason: str = ""):
+    rec = {
         "ts": iso_utc(),
-        "side": side, "symbol": symbol,
-        "qty": qty, "avg": avg, "quote": quote, "reason": reason
-    })
+        "side": side,
+        "symbol": symbol,
+        "qty": qty,
+        "avg": avg,
+        "quote": quote,
+        "reason": reason
+    }
+    data = read_json(TRADES_FILE, {"trades": []})
+    data["trades"].append(rec)
     write_json(TRADES_FILE, data)
+
+    # הדפסת אודיט ידידותית ללוג
+    q_s   = f"{qty:.8f}"   if isinstance(qty, (int,float))   else str(qty)
+    avg_s = f"{avg:.8f}"   if isinstance(avg, (int,float))   else str(avg)
+    qu_s  = f"{quote:.2f}" if isinstance(quote, (int,float)) else str(quote)
+    logging.info(f"TRADE {side} {symbol} qty={q_s} avg={avg_s} quote={qu_s} reason={reason}")
+
 def reload_cfg_if_changed(cfg, client):
     """
     Reload .env into cfg when either reload.flag exists or .env mtime changed.
@@ -127,6 +199,118 @@ def reload_cfg_if_changed(cfg, client):
 # ---------- ENV / CONFIG ----------
 def load_env() -> Dict[str, Any]:
     load_dotenv(ENV_FILE)
+    setup_logging_from_env()   # מאפס לוגים (גם בהוט-רילוד)
+
+    api_key    = os.getenv("BINANCE_API_KEY") or ""
+    api_secret = os.getenv("BINANCE_API_SECRET") or ""
+    env        = (os.getenv("BINANCE_ENV") or "prod").lower()
+    base_url   = PROD_URL if env == "prod" else TESTNET_URL
+    if not api_key or not api_secret:
+        raise RuntimeError("Missing API keys in .env")
+
+    quote_asset        = (os.getenv("QUOTE_ASSET", "USDT") or "USDT").upper()
+    blacklist_keywords = [s.strip().upper() for s in os.getenv("BASE_BLACKLIST", "UP,DOWN,BEAR,BULL,VENFT,BRL").split(",") if s.strip()]
+
+    target_tp_pct     = float(os.getenv("TARGET_TP_PCT", "0.05"))
+    optional_sl_pct   = float(os.getenv("OPTIONAL_SL_PCT", "0.02"))
+    trailing_stop_pct = float(os.getenv("TRAILING_STOP_PCT", "0.02"))
+    trailing_arm_pct  = float(os.getenv("TRAILING_ARM_PNL_PCT", "0.02"))
+
+    portfolio_target_pct = float(os.getenv("PORTFOLIO_TARGET_PCT", "0.05"))
+    portfolio_stop_pct   = float(os.getenv("PORTFOLIO_STOP_PCT", "0.02"))
+
+    max_positions_cfg = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
+    alloc_quote       = float(os.getenv("ALLOCATION_USD", "20"))
+
+    min_quote_vol   = float(os.getenv("MIN_24H_QUOTE_VOL", "15000000"))
+    max_spread_bps  = float(os.getenv("MAX_SPREAD_BPS", "10"))
+    scan_interval   = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
+    eod_hhmm        = os.getenv("EOD_HHMM", "23:59")
+    eod_skip_min    = int(os.getenv("EOD_SKIP_MIN", "90"))
+
+    use_all_balance     = (os.getenv("USE_ALL_BALANCE", "false").lower() == "true")
+    balance_reserve_pct = float(os.getenv("BALANCE_RESERVE_PCT", "0.02"))
+    consolidate_at_start= (os.getenv("CONSOLIDATE_AT_START", "false").lower() == "true")
+
+    auto_split     = (os.getenv("AUTO_SPLIT", "true").lower() == "true")
+    split_slices   = int(os.getenv("SPLIT_SLICES", "2"))
+    min_slice_usd  = float(os.getenv("MIN_SLICE_USD", "20"))
+
+    manage_assets_csv = (os.getenv("MANAGE_EXISTING_ASSETS", "") or "").upper().strip()
+    manage_assets     = [a for a in (s.strip() for s in manage_assets_csv.split(",")) if a]
+    use_cost_basis    = (os.getenv("USE_COST_BASIS_FROM_TRADES", "true").lower() == "true")
+    cost_basis_lookback_days = int(os.getenv("COST_BASIS_LOOKBACK_DAYS", "60"))
+
+    rotation_enabled  = (os.getenv("ROTATION_ENABLED", "true").lower() == "true")
+    rotation_edge_pct = float(os.getenv("ROTATION_EDGE_PCT", "0.20"))
+    fee_bps           = float(os.getenv("FEE_BPS", "10"))
+    slippage_bps      = float(os.getenv("SLIPPAGE_BPS", "5"))
+
+    regime_enabled    = (os.getenv("REGIME_CHECK_ENABLED", "true").lower() == "true")
+    regime_symbols    = [s.strip().upper() for s in os.getenv("REGIME_SYMBOLS","BTCUSDT,ETHUSDT").split(",") if s.strip()]
+    regime_tf         = os.getenv("REGIME_TF","15m")
+    regime_ema_short  = int(os.getenv("REGIME_EMA_SHORT","20"))
+    regime_ema_long   = int(os.getenv("REGIME_EMA_LONG","50"))
+    regime_min_agree  = int(os.getenv("REGIME_MIN_AGREE","1"))
+    regime_cooldown_min = int(os.getenv("REGIME_COOLDOWN_MIN","90"))
+
+    buy_tf            = os.getenv("BUY_TF","5m")
+    buy_ema_short     = int(os.getenv("BUY_EMA_SHORT","20"))
+    buy_ema_long      = int(os.getenv("BUY_EMA_LONG","50"))
+    buy_min_slope_pct_per_bar = float(os.getenv("BUY_MIN_SLOPE_PCT_PER_BAR","0.0002"))
+
+    htf_align_enabled = (os.getenv("HTF_ALIGN_ENABLED","true").lower() == "true")
+    htf_tf            = os.getenv("HTF_TF","1h")
+    htf_ema_short     = int(os.getenv("HTF_EMA_SHORT","20"))
+    htf_ema_long      = int(os.getenv("HTF_EMA_LONG","50"))
+
+    use_maker         = (os.getenv("USE_MAKER","true").lower() == "true")
+    maker_wait_sec    = int(os.getenv("MAKER_WAIT_SEC","10"))
+    loss_cooldown_min = int(os.getenv("LOSS_COOLDOWN_MIN","20"))
+
+    if use_all_balance:
+        auto_split = False
+        max_positions = 1
+    else:
+        max_positions = max_positions_cfg
+
+    http_timeout_sec     = int(os.getenv("HTTP_TIMEOUT_SEC", "10"))
+    api_retry_max        = int(os.getenv("API_RETRY_MAX", "5"))
+    api_retry_backoff_ms = int(os.getenv("API_RETRY_BACKOFF_MS", "300"))
+
+    cfg: Dict[str, Any] = {
+        "api_key": api_key, "api_secret": api_secret, "env": env, "base_url": base_url,
+        "quote_asset": quote_asset, "blacklist_keywords": blacklist_keywords,
+        "alloc_quote": alloc_quote, "max_positions": max_positions,
+        "target_tp_pct": target_tp_pct, "optional_sl_pct": optional_sl_pct,
+        "trailing_stop_pct": trailing_stop_pct, "trailing_arm_pct": trailing_arm_pct,
+        "min_24h_quote_vol": min_quote_vol, "max_spread_bps": max_spread_bps,
+        "scan_interval": scan_interval, "eod_hhmm": eod_hhmm, "eod_skip_min": eod_skip_min,
+        "use_all_balance": use_all_balance, "balance_reserve_pct": balance_reserve_pct,
+        "consolidate_at_start": consolidate_at_start,
+        "auto_split": auto_split, "split_slices": split_slices, "min_slice_usd": min_slice_usd,
+        "portfolio_target_pct": portfolio_target_pct, "portfolio_stop_pct": portfolio_stop_pct,
+        "manage_assets": manage_assets, "use_cost_basis": use_cost_basis,
+        "cost_basis_lookback_days": cost_basis_lookback_days,
+        "rotation_enabled": rotation_enabled, "rotation_edge_pct": rotation_edge_pct,
+        "fee_bps": fee_bps, "slippage_bps": slippage_bps,
+        "regime_enabled": regime_enabled, "regime_symbols": regime_symbols,
+        "regime_tf": regime_tf, "regime_ema_short": regime_ema_short, "regime_ema_long": regime_ema_long,
+        "regime_min_agree": regime_min_agree, "regime_cooldown_min": regime_cooldown_min,
+        "buy_tf": buy_tf, "buy_ema_short": buy_ema_short, "buy_ema_long": buy_ema_long,
+        "buy_min_slope_pct_per_bar": buy_min_slope_pct_per_bar,
+        "htf_align_enabled": htf_align_enabled, "htf_tf": htf_tf, "htf_ema_short": htf_ema_short, "htf_ema_long": htf_ema_long,
+        "use_maker": use_maker, "maker_wait_sec": maker_wait_sec,
+        "loss_cooldown_min": loss_cooldown_min,
+        "http_timeout_sec": http_timeout_sec,
+        "api_retry_max": api_retry_max,
+        "api_retry_backoff_ms": api_retry_backoff_ms,
+    }
+
+    # הרחבות MOB
+    cfg.update(load_env_mobo_extras(os.environ))
+    return cfg
+
 
     # --- helpers: קריאת משתני סביבה חסינה לערכים ריקים ---
     def env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -158,7 +342,7 @@ def load_env() -> Dict[str, Any]:
     base_url   = PROD_URL if env_name == "prod" else TESTNET_URL
     if not api_key or not api_secret:
         raise RuntimeError("Missing API keys in .env")
-
+    setup_logging_from_env()
     # logging
     log_level = (env_str("LOG_LEVEL", "INFO") or "INFO").upper()
     logging.basicConfig(level=getattr(logging, log_level, logging.INFO),
@@ -282,59 +466,166 @@ def load_env() -> Dict[str, Any]:
     }
 
     # <<< חשוב: טען גם את הרחבות MOB >>>
+    cfg = { ... }
     cfg.update(load_env_mobo_extras(os.environ))
 
     return cfg
 
 
-
-# ---------- Client ----------
 def client_from_cfg(cfg) -> SpotClient:
-    return SpotClient(api_key=cfg["api_key"], api_secret=cfg["api_secret"], base_url=cfg["base_url"])
+    return SpotClient(
+        api_key=cfg["api_key"],
+        api_secret=cfg["api_secret"],
+        base_url=cfg["base_url"],
+        timeout=cfg.get("http_timeout_sec", 10)  # <-- חשוב
+    )
+
+
 
 # ---------- Exchange helpers ----------
+# גלובלים למטמון מחיר
+_LAST_MID = {}
+_LAST_MID_TS = {}
+
 def book(client: SpotClient, symbol: str) -> Tuple[float, float]:
-    bk = client.book_ticker(symbol=symbol)
-    return float(bk["bidPrice"]), float(bk["askPrice"])
+    retry_cfg = {
+        "api_retry_max": int(os.getenv("API_RETRY_MAX", "5")),
+        "api_retry_backoff_ms": int(os.getenv("API_RETRY_BACKOFF_MS", "300")),
+    }
+    try:
+        bk = _with_retries(client.book_ticker, retry_cfg, symbol=symbol)
+        bid = float(bk["bidPrice"]); ask = float(bk["askPrice"])
+        mid = (bid + ask) / 2.0 if bid and ask else (ask or bid or 0.0)
+        if mid > 0:
+            _LAST_MID[symbol] = mid
+            _LAST_MID_TS[symbol] = time.time()
+        return bid, ask
+    except Exception as e:
+        logging.warning(f"book_ticker({symbol}) failed ({e}); trying ticker_price fallback")
+        try:
+            tp = _with_retries(client.ticker_price, retry_cfg, symbol=symbol)
+            p = float(tp.get("price", 0.0) or 0.0)
+            if p > 0:
+                _LAST_MID[symbol] = p
+                _LAST_MID_TS[symbol] = time.time()
+                return p, p
+        except Exception as e2:
+            logging.warning(f"ticker_price({symbol}) fallback failed ({e2})")
+
+        # נסה להחזיר מחיר “ישן-טרי” עד פרק זמן סביר
+        stale_ok = int(os.getenv("API_STALE_OK_SEC", "180"))
+        mid = _LAST_MID.get(symbol, 0.0)
+        ts  = _LAST_MID_TS.get(symbol, 0.0)
+        if mid > 0 and (time.time() - ts) <= stale_ok:
+            # נחזיר טווח קטן סביב ה-mid כדי לא לשבור חישובים
+            return mid * 0.999, mid * 1.001
+
+        return 0.0, 0.0
+
 
 def get_account_bal(client: SpotClient, asset: str) -> Tuple[float, float]:
-    acct = client.account(recvWindow=5000)
-    for b in acct["balances"]:
-        if b["asset"] == asset:
-            return float(b["free"]), float(b["locked"])
-    return 0.0, 0.0
+    # רטריי עם דיפולטים מהסביבה
+    retry_cfg = {
+        "api_retry_max": int(os.getenv("API_RETRY_MAX", "5")),
+        "api_retry_backoff_ms": int(os.getenv("API_RETRY_BACKOFF_MS", "300")),
+    }
+    try:
+        acct = _with_retries(client.account, retry_cfg, recvWindow=5000)
+        for b in acct.get("balances", []):
+            if b.get("asset") == asset:
+                return float(b.get("free", 0.0)), float(b.get("locked", 0.0))
+        return 0.0, 0.0
+    except Exception as e:
+        # לא מפילים את הבוט על 502/זמני – מדווחים ומחזירים 0
+        logging.warning(f"account() failed ({e}); treating balance of {asset} as 0 for now")
+        return 0.0, 0.0
 
 def spot_symbols_for_quote(client: SpotClient, quote: str, blacklist_keywords: List[str]) -> List[str]:
-    info = client.exchange_info()
-    syms = []
-    for s in info["symbols"]:
-        if s.get("status") != "TRADING":
-            continue
-        if s.get("isSpotTradingAllowed") is False:
-            continue
-        sym = s["symbol"]
-        if not sym.endswith(quote):
-            continue
-        base = s["baseAsset"].upper()
-        if any(k in base for k in blacklist_keywords):
-            continue
-        if base in STABLES:
-            continue
-        syms.append(sym)
-    return syms
+    try:
+        retry_cfg = {
+            "api_retry_max": int(os.getenv("API_RETRY_MAX", "5")),
+            "api_retry_backoff_ms": int(os.getenv("API_RETRY_BACKOFF_MS", "300")),
+        }
+        info = exchange_info_cached(client, retry_cfg)  # ← cfg מינימלי לרטריי
+        syms = []
+        for s in info["symbols"]:
+            if s.get("status") != "TRADING":
+                continue
+            if s.get("isSpotTradingAllowed") is False:
+                continue
+            sym = s["symbol"]
+            if not sym.endswith(quote):
+                continue
+            base = s["baseAsset"].upper()
+            if any(k in base for k in blacklist_keywords):
+                continue
+            if base in STABLES:
+                continue
+            syms.append(sym)
+        return syms
+    except Exception as e:
+        logging.warning(f"spot_symbols_for_quote: exchange_info unavailable ({e}); using UNIVERSE fallback")
+        universe = (os.getenv("UNIVERSE") or
+                    "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,LTCUSDT,AVAXUSDT,LINKUSDT")
+        ulist = [s.strip().upper() for s in universe.split(",") if s.strip()]
+        out = []
+        for sym in ulist:
+            if not sym.endswith(quote):
+                continue
+            base = sym[:-len(quote)].upper()
+            if any(k in base for k in blacklist_keywords):
+                continue
+            if base in STABLES:
+                continue
+            out.append(sym)
+        return out
 
-def _get_symbol_filters_dict(client: SpotClient, symbol: str) -> dict:
-    info = client.exchange_info(symbol=symbol)
-    s = info["symbols"][0]
-    filt_map = {f["filterType"]: f for f in s.get("filters", [])}
-    return {
+
+# === helpers for LOT_SIZE compliance ===
+from decimal import Decimal, ROUND_DOWN, getcontext
+getcontext().prec = 28  # יציבות חישובית
+
+_filters_cache = {}
+
+def get_symbol_filters(client, symbol):
+    """Cache exchange_info per symbol; returns {'stepSize','minQty','tickSize','minNotional', 'qty_decimals'}"""
+    if symbol in _filters_cache:
+        return _filters_cache[symbol]
+    s = client.exchange_info(symbol=symbol)["symbols"][0]
+    lot  = next(f for f in s["filters"] if f["filterType"] == "LOT_SIZE")
+    price = next(f for f in s["filters"] if f["filterType"] == "PRICE_FILTER")
+    min_notional = next((f for f in s["filters"] if f["filterType"] in ("NOTIONAL","MIN_NOTIONAL")), None)
+
+    step = Decimal(str(lot["stepSize"]))
+    tick = Decimal(str(price["tickSize"]))
+    # כמה ספרות מותר בכמות
+    qty_decimals = max(0, -step.as_tuple().exponent)
+
+    _filters_cache[symbol] = {
+        "stepSize": step,
+        "minQty": Decimal(str(lot.get("minQty", "0"))),
+        "tickSize": tick,
+        "minNotional": Decimal(str(min_notional["minNotional"])) if min_notional else None,
+        "qty_decimals": qty_decimals,
         "base": s["baseAsset"],
         "quote": s["quoteAsset"],
-        "raw": s,
-        "lot": filt_map.get("LOT_SIZE", {}),
-        "price": filt_map.get("PRICE_FILTER", {}),
-        "notional": filt_map.get("NOTIONAL") or filt_map.get("MIN_NOTIONAL") or {},
     }
+    return _filters_cache[symbol]
+
+def floor_to_step(qty: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return qty
+    # floor(qty/step) * step — עם Decimal כדי להימנע משגיאות עשרוניות בינאריות
+    return (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+def fmt_qty(q: Decimal, decimals: int) -> str:
+    # להימנע מ־scientific notation ולחתוך לספרות המותרות
+    q = q.quantize(Decimal(10) ** -decimals, rounding=ROUND_DOWN) if decimals > 0 else q.to_integral_value(rounding=ROUND_DOWN)
+    s = f"{q:f}"
+    # ניקוי אפסים מיותרים בסוף
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
 
 def _quantize_to_step(amount: Decimal, step_str: str) -> Decimal:
     step = Decimal(step_str)
@@ -398,9 +689,15 @@ def score_symbol(client: SpotClient, sym: str) -> float:
     except Exception:
         return 0.0
 
+
 def scan_candidates(client: SpotClient, cfg) -> List[str]:
     all_syms = spot_symbols_for_quote(client, cfg["quote_asset"], cfg["blacklist_keywords"])
-    tickers = client.ticker_24hr()
+    try:
+        tickers = _with_retries(client.ticker_24hr, cfg)  # ← השתמש בזה
+    except Exception as e:
+        logging.warning(f"ticker_24hr failed ({e}); skipping scan iteration")
+        return all_syms[:10]  # fallback דליל
+
     pool: list[tuple[str, float, float]] = []
     for t in tickers:
         sym = t.get("symbol")
@@ -427,6 +724,60 @@ def scan_candidates(client: SpotClient, cfg) -> List[str]:
     cands = [sym for sym, mom, _, _ in ranked if mom > 0][:10]
     logging.info(f"scan: candidates {cands}")
     return cands
+
+_EXINFO_CACHE = {"ts": 0.0, "data": None}
+
+def _with_retries(func, cfg, *args, **kwargs):
+    global _API_ERRS, _API_DOWN_UNTIL
+    cfg = cfg or {}
+    max_try = int(cfg.get("api_retry_max", 5))
+    backoff = max(int(cfg.get("api_retry_backoff_ms", 300)), 50) / 1000.0
+
+    last_exc = None
+    for i in range(max_try):
+        try:
+            res = func(*args, **kwargs)
+            _API_ERRS = 0  # הצלחה מאפסת מונה
+            return res
+        except ServerError as e:
+            last_exc = e
+            logging.warning(f"API server error ({e}); retry {i+1}/{max_try}")
+        except Exception as e:
+            if "502 Bad Gateway" in str(e) or "Read timed out" in str(e):
+                last_exc = e
+                logging.warning(f"API transient error ({e}); retry {i+1}/{max_try}")
+            else:
+                raise
+        # backoff אקספוננציאלי + jitter קל
+        time.sleep(backoff * (1.5 ** i) + random.random()*0.2)
+
+    # אם הגענו לפה, גם אחרי ניסיונות נכשל → נפתח ממסר קצר
+    _API_ERRS += 1
+    thr = int(os.getenv("API_CB_THRESHOLD", "12"))
+    if _API_ERRS >= thr:
+        cool = int(os.getenv("API_CB_COOLDOWN_SEC", "60"))
+        _API_DOWN_UNTIL = time.time() + cool
+        logging.warning(f"API circuit-open for {cool}s (consecutive errors={_API_ERRS})")
+        _API_ERRS = 0  # נאתחל כדי לא להיתקע
+    raise last_exc
+
+def exchange_info_cached(client: SpotClient, cfg, max_age_sec: int = 300):
+    now = time.time()
+    # אם יש מטמון טרי – החזר
+    if _EXINFO_CACHE["data"] and (now - _EXINFO_CACHE["ts"] <= max_age_sec):
+        return _EXINFO_CACHE["data"]
+    try:
+        data = _with_retries(client.exchange_info, cfg)
+        _EXINFO_CACHE["data"] = data
+        _EXINFO_CACHE["ts"] = now
+        return data
+    except Exception as e:
+        # אין API אבל יש מטמון ישן? נשתמש בו
+        if _EXINFO_CACHE["data"]:
+            logging.warning(f"exchange_info failed ({e}) -> using stale cache")
+            return _EXINFO_CACHE["data"]
+        # אין גם מטמון: נרים הלאה כדי ש־fallback יעבוד
+        raise
 
 # ---------- Maker/Market buy ----------
 def buy_market_quote(client: SpotClient, symbol: str, quote_amount: float):
@@ -1027,7 +1378,7 @@ def _as_bool(x, default=False):
 # cfg.update(load_env_mobo_extras(os.environ))
 def load_env_mobo_extras(env: dict):
     ema_stack = (env.get("EMA_STACK") or "20,50,100").split(",")
-    ema_stack = [ _as_int(v, 20) for v in ema_stack ]
+    ema_stack = [_as_int(v, 20) for v in ema_stack]
     rs_looks = (env.get("RS_LOOKBACKS") or "1h,4h").split(",")
     return {
         "strategy": (env.get("STRATEGY") or "LEGACY_5PCT").upper(),
@@ -1051,14 +1402,22 @@ def load_env_mobo_extras(env: dict):
         "tp1_pct": _as_float(env.get("TP1_PCT"), 0.05),
         "tp1_frac": _as_float(env.get("TP1_FRACTION"), 0.50),
         "tp2_pct": _as_float(env.get("TP2_PCT"), 0.12),
+
+        # === SL policy ===
         "sl_min_pct": _as_float(env.get("SL_MIN_PCT"), 0.04),
         "atr_mult_sl": _as_float(env.get("ATR_MULT_SL"), 2.0),
+        "sl_policy": (env.get("SL_POLICY") or "LOW").upper(),  # LOW | FLOOR
 
         "daily_stop_R": _as_float(env.get("DAILY_STOP_R"), -2.0),
         "daily_stop_eq_pct": _as_float(env.get("DAILY_STOP_EQUITY_PCT"), -0.03),
         "kill_slip_bps": _as_float(env.get("KILL_SLIPPAGE_BPS"), 40.0),
         "kill_latency_ms": _as_float(env.get("KILL_LATENCY_MS"), 500.0),
+        "trail_step_up_pct": _as_float(env.get("TRAIL_STEP_UP_PCT"), 0.03),
+        "trail_lock_pct":    _as_float(env.get("TRAIL_LOCK_PCT"),    0.015),
+
     }
+
+
 
 # ---- Data helpers ----
 def get_klines(client, symbol, interval="5m", limit=150):
@@ -1112,20 +1471,30 @@ def highest_high(klines, lookback=20):
     return max(c["high"] for c in klines[-lookback:]) if lookback>0 else 0.0
 
 def orderbook_metrics(client, symbol, bps=10):
-    ob = client.depth(symbol=symbol, limit=500)
+    try:
+        ob = client.depth(symbol=symbol, limit=200)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            raise ValueError("empty orderbook")
+    except Exception as e:
+        logging.warning("depth(%s) failed/empty: %s", symbol, e)
+        return {"mid": 0.0, "spread_bps": 99999.0, "depth10_bid": 0.0, "depth10_ask": 0.0, "imb": 0.5}
+
     best_bid = _as_float(ob["bids"][0][0]); best_ask = _as_float(ob["asks"][0][0])
-    mid = 0.5*(best_bid+best_ask)
-    band = mid * (bps/10_000)
+    mid = 0.5*(best_bid+best_ask) if (best_bid and best_ask) else 0.0
+    band = mid * (bps/10_000) if mid>0 else 0.0
+
     def side_sum(levels, is_bid):
         s = 0.0
-        for px, qty in (( _as_float(p), _as_float(q) ) for p,q in levels):
-            if is_bid and px >= mid - band: s += px*qty
-            if not is_bid and px <= mid + band: s += px*qty
+        if mid<=0 or band<=0: return 0.0
+        for p,q in (( _as_float(p), _as_float(q) ) for p,q in levels):
+            if is_bid and p >= mid - band: s += p*q
+            if not is_bid and p <= mid + band: s += p*q
         return s
+
     bid_usd = side_sum(ob["bids"], True)
     ask_usd = side_sum(ob["asks"], False)
     imb = bid_usd / max(1e-9, (bid_usd+ask_usd))
-    spread_bps = ( (best_ask - best_bid) / mid ) * 10_000 if mid>0 else 99999
+    spread_bps = ((best_ask - best_bid)/mid)*10_000 if mid>0 else 99999.0
     return {"mid": mid, "spread_bps": spread_bps, "depth10_bid": bid_usd, "depth10_ask": ask_usd, "imb": imb}
 
 def ticker_24h_quote_volume(client, symbol):
@@ -1163,30 +1532,58 @@ def mobo_filters_ok(client, symbol, cfg):
 
 def mobo_entry_signal(client, symbol, cfg):
     k5 = get_klines(client, symbol, interval="5m", limit=120)
-    if len(k5) < 40: return False, {}
-    ema20 = ema_last([c["close"] for c in k5], cfg["ema_stack"][0])
-    ema50 = ema_last([c["close"] for c in k5], cfg["ema_stack"][1])
-    ema100= ema_last([c["close"] for c in k5], cfg["ema_stack"][2])
-    ret15 = ret_pct_nbars(k5, 3)  # 3×5m = 15m
+    if len(k5) < 40:
+        return False, {}
+
+    closes = [c["close"] for c in k5]
+    ema20 = ema_last(closes, cfg["ema_stack"][0])
+    ema50 = ema_last(closes, cfg["ema_stack"][1])
+    ema100= ema_last(closes, cfg["ema_stack"][2])
+
+    ret15 = ret_pct_nbars(k5, 3)   # 15 דקות
     zvol  = vol_zscore_20(k5)
     hh20  = highest_high(k5, 20)
     close = k5[-1]["close"]
-    breakout = (close > hh20 * cfg["breakout_mult"]) and (k5[-1]["volume"] >= cfg["entry_vol_mult"] * (sum(c["volume"] for c in k5[-20:])/20.0))
-    momentum = (ema20>ema50>ema100) and (ret15 >= cfg["momentum_ret_15m"])
-    # orderbook imbalance
+
+    # תנאים רכים לטסטנט
+    avg20vol = (sum(c["volume"] for c in k5[-20:]) / 20.0) if len(k5) >= 20 else k5[-1]["volume"]
+
+    vol_ok = (k5[-1]["volume"] >= cfg["entry_vol_mult"] * avg20vol)
+    if not cfg.get("require_vol_confirmation", True):
+        vol_ok = True
+
     obm = orderbook_metrics(client, symbol, bps=10)
-    momentum = momentum and (obm["imb"] >= cfg["ob_imb_min"])
+    imb_ok = (obm["imb"] >= cfg["ob_imb_min"])
+    if not cfg.get("require_orderbook_imbalance", True):
+        imb_ok = True
+
+    breakout = (close > hh20 * cfg["breakout_mult"]) and vol_ok
+    momentum = (ema20 > ema50 > ema100) and (ret15 >= cfg["momentum_ret_15m"]) and imb_ok
     event_sig = (zvol > cfg["event_vol_z"])
+
     signal = breakout or momentum or event_sig
     if not signal:
-        logging.debug(f"[MOB] {symbol}: no-entry | bo={breakout} mo={momentum} ev={event_sig} z={zvol:.2f} ret15={ret15:.4f} imb={obm['imb']:.2f}")
-    return signal, {"ema20":ema20,"ema50":ema50,"ema100":ema100,"ret15":ret15,"zvol":zvol,"hh20":hh20,"close":close,"obm":obm}
+        logging.debug(f"[MOB] {symbol}: no-entry | "
+                      f"bo={breakout} mo={momentum} ev={event_sig} "
+                      f"z={zvol:.2f} ret15={ret15:.4f} imb={obm['imb']:.2f} "
+                      f"vol_ok={vol_ok} imb_ok={imb_ok}")
+    return signal, {
+        "ema20": ema20, "ema50": ema50, "ema100": ema100,
+        "ret15": ret15, "zvol": zvol, "hh20": hh20, "close": close, "obm": obm
+    }
+
 
 def mobo_atr_sl_tp(cfg, klines5m):
     apct = atr_pct(klines5m, 14)
-    sl_pct = min(cfg["sl_min_pct"], cfg["atr_mult_sl"]*apct)
+    two_atr = cfg["atr_mult_sl"] * apct
+    policy = (cfg.get("sl_policy") or "LOW").upper()  # LOW=min(...), FLOOR=max(...)
+    if policy == "FLOOR":
+        sl_pct = max(cfg["sl_min_pct"], two_atr)
+    else:
+        sl_pct = min(cfg["sl_min_pct"], two_atr)
     tp1_pct = cfg["tp1_pct"]; tp2_pct = cfg["tp2_pct"]
     return apct, sl_pct, tp1_pct, tp2_pct
+
 
 def mobo_position_size_quote(equity_quote, atr_percent, cfg):
     # risk_per_trade_pct supports "0.75" (percent) or "0.0075" (fraction)
@@ -1199,39 +1596,116 @@ def mobo_position_size_quote(equity_quote, atr_percent, cfg):
 
 # ---- Execution (simple & robust: market only + bot-managed TP/SL) ----
 def _symbol_filters(client, symbol):
-    s = client.exchange_info(symbol=symbol)["symbols"][0]
-    lot  = next(f for f in s["filters"] if f["filterType"] == "LOT_SIZE")
-    price= next(f for f in s["filters"] if f["filterType"] == "PRICE_FILTER")
-    notional = next((f for f in s["filters"] if f["filterType"] in ("NOTIONAL","MIN_NOTIONAL")), None)
-    return { "stepSize": _as_float(lot["stepSize"]), "minQty": _as_float(lot.get("minQty",0.0)),
-             "tickSize": _as_float(price["tickSize"]), "minNotional": _as_float(notional["minNotional"]) if notional else None }
+    try:
+        info = client.exchange_info(symbol=symbol)
+    except Exception as e:
+        logging.warning("exchange_info(%s) failed: %s", symbol, e)
+        # דיפולטים שמרניים כדי לא למות
+        return {"stepSize": 1.0, "minQty": 0.0, "tickSize": 0.00000001, "minNotional": None}
+
+    s = (info.get("symbols") or [{}])[0]
+    fl = s.get("filters", []) or []
+
+    def getf(ftype):
+        for f in fl:
+            if f.get("filterType") == ftype:
+                return f
+        return {}
+
+    lot = getf("LOT_SIZE")
+    price = getf("PRICE_FILTER")
+    notion = getf("NOTIONAL") or getf("MIN_NOTIONAL")
+
+    step = _as_float(lot.get("stepSize"), 1.0)          # דיפולט 1 כדי לא לחלק ב-0
+    minq = _as_float(lot.get("minQty"), 0.0)
+    tick = _as_float(price.get("tickSize"), 0.00000001)
+    min_notional = _as_float(notion.get("minNotional"), None) if notion else None
+
+    return {"stepSize": step, "minQty": minq, "tickSize": tick, "minNotional": min_notional}
 
 def _round_down(x, step):
     if step<=0: return x
     return math.floor(x/step)*step
 
 def mobo_open_position(client, symbol, quote_amt, cfg):
-    # market buy all (פשוט ועמיד; אם תרצה 60/40 השתמש ב-limit maker לחלק)
-    ob = orderbook_metrics(client, symbol)
-    price = ob["mid"] if ob["mid"]>0 else _as_float(client.ticker_price(symbol).get("price"), 0.0)
     flt = _symbol_filters(client, symbol)
-    qty = _round_down(quote_amt / max(price,1e-9), flt["stepSize"])
+    price = orderbook_metrics(client, symbol)["mid"] or _as_float(client.ticker_price(symbol).get("price"), 0.0)
+    if price <= 0: raise ValueError("price=0")
+    qty = _round_down(quote_amt / price, flt["stepSize"])
     if flt["minQty"] and qty < flt["minQty"]:
         raise ValueError("qty below minQty")
+    if flt["minNotional"] and (qty*price) < flt["minNotional"]:
+        raise ValueError("below minNotional")
     ord = client.new_order(symbol=symbol, side="BUY", type="MARKET", quantity=str(qty))
     exe_qty = _as_float(ord.get("executedQty"), 0.0)
     cqq = _as_float(ord.get("cummulativeQuoteQty"), 0.0)
     avg = (cqq/exe_qty) if exe_qty>0 else price
     return exe_qty, avg, cqq
 
-def mobo_close_market(client, symbol, qty):
-    if qty<=0: return 0.0, 0.0
-    ord = client.new_order(symbol=symbol, side="SELL", type="MARKET", quantity=str(qty))
-    exe_qty = _as_float(ord.get("executedQty"), 0.0)
-    cqq = _as_float(ord.get("cummulativeQuoteQty"), 0.0)
-    avg = (cqq/exe_qty) if exe_qty>0 else 0.0
-    return exe_qty, avg, cqq
+def mobo_close_market(client, symbol: str, sell_qty_float: float):
+    """
+    סגירה בשוק תוך התאמה ל-LOT_SIZE.
+    מחזיר (executedQty, avgPrice, cummulativeQuoteQty).
+    אם הכמות החוקית קטנה מ-minQty — נחשב Dust ולא שולחים הזמנה.
+    """
+    f = get_symbol_filters(client, symbol)
+    step = f["stepSize"]
+    minq = f["minQty"]
+    q_dec = f["qty_decimals"]
 
+    qty = Decimal(str(sell_qty_float))
+    qty = floor_to_step(qty, step)
+
+    # אם אחרי רצפה נפלנו מתחת למינימום — אין טעם לנסות
+    if qty < minq or qty <= 0:
+        # לוג: אבק; תטפל בזה בשכבת ה-manage (רא׳ סעיף 3)
+        return 0.0, 0.0, 0.0
+
+    # להקטין טיפה כדי להימנע מ-INSUFFICIENT_BALANCE/עמלות
+    qty = floor_to_step(qty * Decimal("0.999"), step)
+
+    # לולאת נסיונות—מטפלת ב-LOT_SIZE/-2010
+    attempts = 0
+    while attempts < 5:
+        try:
+            q_str = fmt_qty(qty, q_dec)
+            resp = client.new_order(
+                symbol=symbol,
+                side="SELL",
+                type="MARKET",
+                quantity=q_str,
+            )
+            exq  = Decimal(resp.get("executedQty", "0"))
+            cqq  = Decimal(resp.get("cummulativeQuoteQty", "0"))
+            avg  = (cqq / exq) if exq > 0 else Decimal("0")
+            return float(exq), float(avg), float(cqq)
+
+        except ClientError as e:
+            msg = str(getattr(e, "error_message", "")) or str(e)
+            code = getattr(e, "error_code", None)
+            # בעיית LOT_SIZE → נקטין וננסה שוב
+            if code == -1013 and "LOT_SIZE" in msg:
+                qty = floor_to_step(qty * Decimal("0.98"), step)
+                if qty < minq or qty <= 0:
+                    return 0.0, 0.0, 0.0
+                attempts += 1
+                continue
+            # יתרה לא מספיקה/תנאי כמות → נקטין עוד
+            if code == -2010 or "insufficient" in msg.lower():
+                qty = floor_to_step(qty * Decimal("0.98"), step)
+                if qty < minq or qty <= 0:
+                    return 0.0, 0.0, 0.0
+                attempts += 1
+                continue
+            # חריגה אחרת — נרים הלאה
+            raise
+    # לא הצלחנו
+    return 0.0, 0.0, 0.0
+def qty_below_min(client, symbol, qty_float: float) -> bool:
+    f = get_symbol_filters(client, symbol)
+    return Decimal(str(qty_float)) < f["minQty"]
+
+# בתוך mobo_manage_one, ממש בתחילת הה
 # ---- State helpers (positions.json compatible) ----
 def mobo_make_state(sym, qty, entry, atrp, sl_pct, tp1, tp2, now_ts):
     return {
@@ -1250,124 +1724,292 @@ def mobo_make_state(sym, qty, entry, atrp, sl_pct, tp1, tp2, now_ts):
     }
 
 def mobo_manage_one(client, symbol, pstate, cfg):
-    # returns (updated_state, maybe_closed, sold_quote_pnl)
-    # prices
+    
+    """
+    מנהל פוזיציית MOB אחת.
+    מחזיר: (updated_state, closed_bool, realized_quote_pnl)
+    """
+    # --- מחירים ועדכונים בסיסיים ---
     ob = orderbook_metrics(client, symbol)
-    price = ob["mid"]
-    entry = pstate["entry"]
-    qty = pstate["qty"]
-    # SL logic
-    be_price = pstate["trail_anchor"]
-    sl_pct = pstate["sl_pct"]
-    stop_price = (be_price*(1.0 - sl_pct))
-    # TP/TP1/Trail
-    tp1_price = entry*(1.0 + pstate["tp1_pct"])
-    tp2_price = entry*(1.0 + pstate["tp2_pct"])
+    price = ob.get("mid") or _as_float(getattr(client, "ticker_price")(symbol).get("price"), 0.0)
+    entry = float(pstate.get("entry", 0.0))
+    qty   = float(pstate.get("qty", 0.0))
+
+    # אם אין לנו נתונים סבירים – לא עושים כלום
+    if qty <= 0 or entry <= 0 or price <= 0:
+        return pstate, False, 0.0
 
     quote_pnl = 0.0
-    # TP1: take half & move to BE
-    if (not pstate["tp1_done"]) and price >= tp1_price:
-        sell_qty = qty * cfg["tp1_frac"]
-        exq, avg, cqq = mobo_close_market(client, symbol, sell_qty)
-        if exq>0:
-            pstate["qty"] = qty - exq
-            pstate["tp1_done"] = True
-            pstate["trail_active"] = True
-            pstate["trail_anchor"] = max(entry, price)  # move to BE+
-            quote_pnl += (cqq - exq*entry)
 
-    # Trailing: for every +3% since last_trail_up, raise BE anchor by 1.5%
+    # --- רמות יעד/עצירה ---
+    tp1_pct = float(pstate.get("tp1_pct", cfg.get("tp1_pct", 0.05)))
+    tp2_pct = float(pstate.get("tp2_pct", cfg.get("tp2_pct", 0.12)))
+    sl_pct  = float(pstate.get("sl_pct",  cfg.get("sl_min_pct", 0.04)))
+
+    tp1_price = entry * (1.0 + tp1_pct)
+    tp2_price = entry * (1.0 + tp2_pct)
+
+    be_anchor = float(pstate.get("trail_anchor", entry))
+    stop_price = be_anchor * (1.0 - max(0.0, sl_pct))
+
+    # --- TP1: מוכרים חלק מהכמות ומעלים עוגן ל-BE+ ---
+    if (not pstate.get("tp1_done")) and price >= tp1_price and qty > 0:
+        tp1_frac = float(cfg.get("tp1_frac", 0.5))
+        sell_qty = max(0.0, qty * tp1_frac)
+        if sell_qty > 0:
+            exq, avg, cqq = mobo_close_market(client, symbol, sell_qty)
+            if exq > 0:
+                pstate["qty"] = qty - exq
+                pstate["tp1_done"] = True
+                pstate["trail_active"] = True
+                pstate["trail_anchor"] = max(entry, price)
+                quote_pnl += (cqq - exq * entry)
+
+                # NEW: לוג וטרייד-לוג
+                log_trade("SELL", symbol, exq, avg=avg, quote=cqq, reason="TP1")
+                logging.info(f"[MOB] TP1 SELL {symbol} qty={exq:.8f} avg={avg:.8f}")
+
+                try:
+                    log_trade("SELL", symbol, exq, avg=avg, quote=cqq, reason="MOB-TP1")
+                except Exception:
+                    pass
+                # נעדכן משתנה מקומי להמשך הבדיקות
+                qty = float(pstate["qty"])
+
+    # --- Trailing: כל עליה של ~3% מהעוגן → נועל 1.5% ---
+    step_up = float(cfg.get("trail_step_up_pct", 0.03) or 0.03)
+    lock    = float(cfg.get("trail_lock_pct",    0.015) or 0.015)
     if pstate["trail_active"]:
-        move_from_anchor = (price / pstate["trail_anchor"] - 1.0) if pstate["trail_anchor"]>0 else 0.0
-        if move_from_anchor >= 0.03 - 1e-6:
-            pstate["trail_anchor"] = price * (1.0 - 0.015)  # lock 1.5% below
+        move_from_anchor = (price / pstate["trail_anchor"] - 1.0) if pstate["trail_anchor"] > 0 else 0.0
+        if move_from_anchor >= step_up - 1e-6:
+            pstate["trail_anchor"] = price * (1.0 - lock)
             pstate["last_trail_up"] = price
 
-    # Hard SL check
-    # we enforce SL on remaining qty
-    if pstate["qty"] > 0 and price <= stop_price:
-        exq, avg, cqq = mobo_close_market(client, symbol, pstate["qty"])
-        if exq>0:
-            quote_pnl += (cqq - exq*entry)
+    # --- SL על היתרה ---
+    if float(pstate.get("qty", 0.0)) > 0 and price <= stop_price:
+        exq, avg, cqq = mobo_close_market(client, symbol, float(pstate["qty"]))
+        if exq > 0:
+            quote_pnl += (cqq - exq * entry)
             pstate["qty"] = 0.0
+            log_trade("SELL", symbol, exq, avg=avg, quote=cqq, reason="SL")
+            logging.info(f"[MOB] SL SELL {symbol} qty={exq:.8f} avg={avg:.8f}")
+            try:
+                log_trade("SELL", symbol, exq, avg=avg, quote=cqq, reason="MOB-SL")
+            except Exception:
+                pass
             return pstate, True, quote_pnl
 
-    # TP2: close remainder if reached
-    if pstate["qty"] > 0 and price >= tp2_price:
-        exq, avg, cqq = mobo_close_market(client, symbol, pstate["qty"])
-        if exq>0:
-            quote_pnl += (cqq - exq*entry)
+    # --- TP2: סגירת יתרה ---
+    if float(pstate.get("qty", 0.0)) > 0 and price >= tp2_price:
+        exq, avg, cqq = mobo_close_market(client, symbol, float(pstate["qty"]))
+        if exq > 0:
+            quote_pnl += (cqq - exq * entry)
             pstate["qty"] = 0.0
+            logging.info(f"[MOB] EXIT TP2 {symbol} qty={exq:.8f} avg≈{avg:.8f}")
+            try:
+                log_trade("SELL", symbol, exq, avg=avg, quote=cqq, reason="MOB-TP2")
+            except Exception:
+                pass
             return pstate, True, quote_pnl
 
-    # TTL
+    # --- TTL (משך מקסימלי בפוזיציה) ---
     try:
-        opened = datetime.fromisoformat(pstate["opened_at"].replace("Z","").replace("+00:00","")).replace(tzinfo=timezone.utc)
+        opened = datetime.fromisoformat(
+            str(pstate.get("opened_at","")).replace("Z","").replace("+00:00","")
+        ).replace(tzinfo=timezone.utc)
     except Exception:
         opened = datetime.now(timezone.utc)
-    hours_open = (datetime.now(timezone.utc) - opened).total_seconds()/3600.0
-    if pstate["qty"]>0 and hours_open >= cfg["max_time_hours"]:
-        exq, avg, cqq = mobo_close_market(client, symbol, pstate["qty"])
-        if exq>0:
-            quote_pnl += (cqq - exq*entry)
+
+    hours_open = (datetime.now(timezone.utc) - opened).total_seconds() / 3600.0
+    if float(pstate.get("qty", 0.0)) > 0 and hours_open >= float(cfg.get("max_time_hours", 12)):
+        exq, avg, cqq = mobo_close_market(client, symbol, float(pstate["qty"]))
+        if exq > 0:
+            quote_pnl += (cqq - exq * entry)
             pstate["qty"] = 0.0
+            log_trade("SELL", symbol, exq, avg=avg, quote=cqq, reason="TTL")
+            logging.info(f"[MOB] TTL SELL {symbol} qty={exq:.8f} avg={avg:.8f}")
+            try:
+                log_trade("SELL", symbol, exq, avg=avg, quote=cqq, reason="MOB-TTL")
+            except Exception:
+                pass
             return pstate, True, quote_pnl
 
     return pstate, False, quote_pnl
 
-# ---- One-iteration orchestrator ----
-def mobo_try_enter_for_symbol(client, cfg, symbol, equity_quote, positions_map, log_trade_fn):
-    ok, obm = mobo_filters_ok(client, symbol, cfg)
-    if not ok: return False
-    sig, info = mobo_entry_signal(client, symbol, cfg)
-    if not sig: return False
 
-    k5 = get_klines(client, symbol, interval="5m", limit=60)
-    apct, sl_pct, tp1, tp2 = mobo_atr_sl_tp(cfg, k5)
-    quote_amt = mobo_position_size_quote(equity_quote, apct, cfg)
-    if quote_amt <= 0: 
-        logging.debug(f"[MOB] {symbol}: sizing=0 (equity={equity_quote:.2f}, atr%={apct:.4f})")
-        return False
+def log_positions_snapshot(client, state, cfg):
+    if not state["positions"]:
+        return
+    rows = []
+    total_unrl = 0.0
+    for sym, ps in list(state["positions"].items()):
+        try:
+            bid, ask = book(client, sym)
+            mid = (bid + ask) / 2.0 if bid and ask else (ask or bid or 0.0)
+            entry = float(ps.get("entry", 0.0) or 0.0)
+            qty   = float(ps.get("qty", 0.0) or 0.0)
+            sl_pct  = float(ps.get("sl_pct",  cfg.get("optional_sl_pct", 0.0)) or 0.0)
+            tp1_pct = float(ps.get("tp1_pct", cfg.get("target_tp_pct", 0.05)) or 0.05)
+            tp2_pct = float(ps.get("tp2_pct", cfg.get("target_tp_pct", 0.10)) or 0.10)
 
-    try:
-        qty, avg, cq = mobo_open_position(client, symbol, quote_amt, cfg)
-        if qty <= 0: 
-            logging.info(f"[MOB] {symbol}: market BUY executed 0")
-            return False
-        now_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-        state = mobo_make_state(symbol, qty, avg, apct, sl_pct, tp1, tp2, now_ts)
-        positions_map[symbol] = state
-        # trade log
-        if log_trade_fn:
-            log_trade_fn("BUY", symbol, qty, avg=avg, quote=cq, reason="MOB-entry")
-        logging.info(f"[MOB] BUY {symbol} qty={qty:.8f} avg={avg:.8f} tp1={tp1*100:.1f}% tp2={tp2*100:.1f}% sl={sl_pct*100:.1f}%")
-        return True
-    except Exception as e:
-        logging.error(f"[MOB] entry failed for {symbol}: {e}")
-        return False
+            if entry > 0 and mid > 0:
+                pnl_pct = (mid/entry - 1.0) * 100.0
+                unrl    = qty * (mid - entry)  # ב-QUOTE
+                total_unrl += unrl
+            else:
+                pnl_pct = 0.0
+                unrl    = 0.0
 
-def mobo_manage_all(client, cfg, positions_map, log_trade_fn):
-    realized = 0.0
-    to_delete = []
-    for sym, ps in positions_map.items():
-        if ps.get("strategy") != "MOB": 
-            continue
-        new_ps, closed, q_pnl = mobo_manage_one(client, sym, ps, cfg)
-        positions_map[sym] = new_ps
-        if q_pnl != 0 and log_trade_fn:
-            # we log SELL chunks inside manage_one
+            anchor = float(ps.get("trail_anchor", entry) or entry)
+            tp1 = entry * (1.0 + tp1_pct)
+            tp2 = entry * (1.0 + tp2_pct)
+            sl  = anchor * (1.0 - sl_pct)
+
+            def dist_pct(target, ref):
+                return ((target / ref) - 1.0) * 100.0 if ref > 0 else 0.0
+
+            d_tp1 = dist_pct(tp1, mid)  # כמה אחוז חסר ל-TP1 (אם חיובי → עוד צריך לעלות)
+            d_tp2 = dist_pct(tp2, mid)
+            d_sl  = dist_pct(sl,  mid)  # יהיה שלילי (כמה אחוז לרדת עד SL)
+
+            rows.append(
+                f"{sym}: qty={qty:.6f} | price≈{mid:.6f} entry={entry:.6f} "
+                f"| PnL={pnl_pct:.2f}% (~{unrl:.2f} {cfg['quote_asset']}) "
+                f"| toTP1={d_tp1:.2f}% toTP2={d_tp2:.2f}% toSL={d_sl:.2f}%"
+            )
+        except Exception as e:
+            rows.append(f"{sym}: snapshot error {e}")
+    if rows:
+        logging.info("positions snapshot:\n  " + "\n  ".join(rows) +
+                     f"\n  total_unrealized≈{total_unrl:.2f} {cfg['quote_asset']}")
+
+import time
+import logging
+from decimal import Decimal
+try:
+    from binance.error import ClientError
+except Exception:
+    ClientError = Exception  # ביטוח למקרה שהייבוא אצלך במקום א
+def mobo_manage_all(client, cfg: dict, positions: Dict[str, Any], log=None) -> float:
+    """
+    מנהל את כל הפוזיציות (MO), מעדכן את positions in-place ומחזיר רק את ה-PnL הממומש (float).
+    חתימה זו תואמת לקריאה: mobo_manage_all(client, cfg, state["positions"], log_trade)
+    """
+
+    # -------- לוג גמיש --------
+    def L(level: str, msg: str):
+        try:
+            if hasattr(log, level):                 # logging.Logger
+                getattr(log, level)(msg); return
+            if hasattr(log, "log"):                 # אובייקט עם .log(level,msg)
+                log.log(level, msg); return
+            if callable(log):
+                try: log(level, msg); return        # פונקציה (level, msg)
+                except TypeError: log(msg); return  # פונקציה (msg)
+        except Exception:
             pass
-        realized += q_pnl
-        if closed:
-            if log_trade_fn and q_pnl != 0:
-                side = "SELL"
-                qty_sold = ps["qty"]  # after close became 0; for log we can’t recover exact
-                log_trade_fn(side, sym, qty=None, avg=None, quote=None, reason="MOB-exit")
-            to_delete.append(sym)
-    for s in to_delete:
-        positions_map.pop(s, None)
-    return realized
-# ===================== End MOB Patch =====================
+        print(f"[MOB][{level.upper()}] {msg}")
+
+    # -------- עזרים פנימיים --------
+    def _extract_qty(ps: Any):
+        """מחזיר כמות כ-float או None אם לא ניתן לחלץ."""
+        try:
+            if isinstance(ps, dict):
+                if "qty" in ps: return float(ps["qty"])
+                # תמיכה בשמות נפוצים
+                for k in ("base_qty", "quantity", "amount"):
+                    if k in ps: return float(ps[k])
+                return None
+            # אם זה מספר/מחרוזת מספרית
+            return float(ps)
+        except Exception:
+            return None
+
+    def _is_dust(symbol: str, qty: float) -> bool:
+        """בודק אם הכמות מתחת minQty. אם אין פונקציות עזר – נשתמש בכלל אצבע."""
+        try:
+            # אם יש לך את הפונקציה הזו בפרויקט – היא תיקרא כאן
+            return qty_below_min(client, symbol, qty)  # type: ignore[name-defined]
+        except Exception:
+            # כלל אצבע בטוח שלא יכניס ללולאות: אבק זעיר נסגר לוגית
+            return qty <= 0 or qty < 1e-12
+
+    total_q_pnl = Decimal("0")
+    new_positions: Dict[str, Any] = {}
+    closed_symbols = []
+    consecutive_lot_size_errors = 0
+
+    # נעבוד על צילום מצב כדי לא לשנות את המילון תוך כדי איטרציה
+    for symbol, ps in list(positions.items()):
+        qty = _extract_qty(ps)
+        if qty is None:
+            L("error", f"{symbol}: position object malformed (no qty) → leaving as-is")
+            new_positions[symbol] = ps
+            continue
+
+        # אם זה אבק מראש — נסגור לוגית
+        if _is_dust(symbol, qty):
+            L("info", f"{symbol}: qty {qty} < minQty → mark closed (dust)")
+            closed_symbols.append(symbol)
+            continue
+
+        # נרכיב אובייקט פוזיציה להעברה ל-manage_one
+        ps_obj = dict(ps) if isinstance(ps, dict) else {"qty": qty}
+
+        try:
+            # IMPORTANT: הפונקציה הזו צריכה להיות קיימת אצלך
+            new_ps, closed, q_pnl = mobo_manage_one(client, symbol, ps_obj, cfg)
+            total_q_pnl += Decimal(str(q_pnl or 0))
+
+            # בדיקת אבק/אפס אחרי ניהול
+            post_qty = _extract_qty(new_ps)
+            if post_qty is None or post_qty <= 0 or _is_dust(symbol, float(post_qty)):
+                closed = True
+
+            if closed:
+                closed_symbols.append(symbol)
+            else:
+                new_positions[symbol] = new_ps
+
+            consecutive_lot_size_errors = 0
+
+        except ClientError as e:
+            emsg = getattr(e, "error_message", "") or str(e)
+            ecode = getattr(e, "error_code", None)
+            L("error", f"manage error on {symbol}: {e}")
+
+            if ecode == -1013 and "LOT_SIZE" in emsg:
+                consecutive_lot_size_errors += 1
+                # אם הכמות בפועל כבר אבק — נסגור לוגית כדי למנוע לולאה
+                if _is_dust(symbol, qty):
+                    L("info", f"{symbol}: LOT_SIZE + dust → mark closed")
+                    closed_symbols.append(symbol)
+                    continue
+                # דיליי קטן להורדת עומס/הצפה
+                time.sleep(min(2.0, 0.3 * consecutive_lot_size_errors))
+                # נשאיר לפעם הבאה
+                new_positions[symbol] = ps
+                continue
+
+            # שגיאה אחרת – משאירים כמות שהוא
+            new_positions[symbol] = ps
+
+        except Exception as e:
+            L("error", f"unexpected manage error on {symbol}: {e}")
+            new_positions[symbol] = ps
+
+    # עדכון in-place של מילון הפוזיציות שהועבר מבחוץ
+    positions.clear()
+    positions.update(new_positions)
+
+    # לוג מסכם קצר
+    if closed_symbols:
+        L("info", f"closed: {', '.join(closed_symbols)} | realized PnL={float(total_q_pnl):.4f} {cfg.get('quote_asset','')}")
+    else:
+        L("info", f"no closures | realized PnL={float(total_q_pnl):.4f} {cfg.get('quote_asset','')}")
+
+    return float(total_q_pnl)
+
 
 # ---------- State ----------
 def load_positions() -> Dict:
@@ -1375,6 +2017,58 @@ def load_positions() -> Dict:
 
 def save_positions(state: Dict):
     write_json(STATE_FILE, state)
+
+# ---- One-iteration orchestrator (MOB) ----
+def mobo_try_enter_for_symbol(client, cfg, symbol, equity_quote, positions_map, log_trade_fn):
+    """
+    מנסה לפתוח פוזיציה חדשה ב־symbol אם כל התנאים מתקיימים.
+    מחזיר True אם נפתחה פוזיציה, אחרת False.
+    """
+    try:
+        # אל תפתח אם כבר פתוח
+        if symbol in positions_map:
+            return False
+
+        # פילטרי MOB (נזילות/ספר/RS)
+        ok, obm = mobo_filters_ok(client, symbol, cfg)
+        if not ok:
+            return False
+
+        # טריגר כניסה (breakout/momentum/event)
+        sig, info = mobo_entry_signal(client, symbol, cfg)
+        if not sig:
+            return False
+
+        # ATR/SL/TP לפי 5m
+        k5 = get_klines(client, symbol, interval="5m", limit=60)
+        apct, sl_pct, tp1, tp2 = mobo_atr_sl_tp(cfg, k5)
+
+        # גודל פוזיציה בדולרים
+        quote_amt = mobo_position_size_quote(equity_quote, apct, cfg)
+        if quote_amt <= 0:
+            logging.debug(f"[MOB] {symbol}: sizing=0 (equity={equity_quote:.2f}, atr%={apct:.4f})")
+            return False
+
+        # ביצוע קנייה (Market פשוט ועמיד)
+        qty, avg, cqq = mobo_open_position(client, symbol, quote_amt, cfg)
+        if qty <= 0:
+            logging.info(f"[MOB] {symbol}: market BUY executed 0")
+            return False
+
+        now_ts = datetime.now(timezone.utc).isoformat()
+        positions_map[symbol] = mobo_make_state(symbol, qty, avg, apct, sl_pct, tp1, tp2, now_ts)
+
+        # לוג + רישום טרייד
+        if log_trade_fn:
+            log_trade_fn("BUY", symbol, qty, avg=avg, quote=cqq, reason="MOB-entry")
+        logging.info(f"[MOB] BUY {symbol} qty={qty:.8f} avg={avg:.8f} tp1={tp1*100:.1f}% tp2={tp2*100:.1f}% sl={sl_pct*100:.1f}%")
+
+        return True
+
+    except Exception as e:
+        logging.error(f"[MOB] entry failed for {symbol}: {e}")
+        return False
+
 
 # ---------- Main ----------
 def main():
@@ -1402,7 +2096,7 @@ def main():
 
     last_scan = 0.0
     wait_until_ts = 0.0
-
+    last_heartbeat = 0.0
     while True:
         if STOP_FLAG.exists():
             logging.info('stop.flag detected -> exiting main loop')
@@ -1411,9 +2105,23 @@ def main():
             # hot reload
             cfg, client, reloaded = reload_cfg_if_changed(cfg, client)
             if reloaded:
+                setup_logging_from_env()
                 logging.info("Hot-reload: applied new .env settings")
-
             now_ts = time.time()
+
+            # אם הממסר “פתוח” – דלג זמנית על כל לוגיקת הסריקה/ניהול
+            if now_ts < _API_DOWN_UNTIL:
+                left = int(_API_DOWN_UNTIL - now_ts)
+                # heartbeat כבר רץ — נוסיף שורה אינפורמטיבית קצרה
+                logging.info(f"API_DOWN: skipping work for ~{left}s (recent 5xx)")
+                time.sleep(1)
+                continue
+
+            if now_ts - last_heartbeat >= 30:
+                if int(time.time()) % 30 == 0:  # כל ~30 שניות
+                    log_positions_snapshot(client, state, cfg)
+                logging.info(f"heartbeat: alive | positions={len(state['positions'])} | cooldown_until={int(max(0, wait_until_ts - now_ts))}s")
+                last_heartbeat = now_ts
             sig = regime_signal(client, cfg)   # +1 bull, 0 neutral, -1 bear
 
             if sig < 0:
@@ -1494,6 +2202,10 @@ def main():
                 start_value = portfolio_value_quote(client, state, cfg)
                 time.sleep(65)
                 last_scan = 0.0
+                        # אחרי כל סריקה, אם אין פוזיציות – תן דיאגנוסטיקה על טופ סימבולים
+            if cfg.get("strategy","LEGACY_5PCT").upper() == "MOMENTUM_BREAKOUT" and not state["positions"]:
+                mobo_debug_scan(client, cfg, max_syms=15)
+
 
         except Exception as e:
             logging.exception(f"main loop error: {e}")
